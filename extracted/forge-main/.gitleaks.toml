@@ -1,0 +1,65 @@
+# Gitleaks configuration (HARD-09). Extends the built-in default ruleset.
+#
+# Allowlist policy: entries must be NARROW (a named file, not a directory glob
+# wildcard-ing the whole tree) and each must say WHY the match is not a secret.
+# A new fake credential in a new test file is EXPECTED to trip the scan — the
+# author either uses an obviously-fake value or consciously extends this list.
+
+title = "forge gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Reviewed non-secrets (HARD-09 baseline, 2026-07-04)"
+paths = [
+  # Fake secrets deliberately embedded to exercise the redaction layer.
+  '''packages/observability/tests/test_tracing\.py''',
+  '''packages/observability/tests/test_telemetry_logging\.py''',
+  '''packages/auth-sdk/tests/test_redaction\.py''',
+  '''packages/knowledge-core/tests/test_mcp_redaction\.py''',
+  # HARD-03: fake jina-/cohere-secret shapes exercising the reranker redactor
+  # (GracefulReranker / JinaRerankerClient) — no real credential.
+  '''packages/knowledge-core/tests/test_reranker\.py''',
+  '''packages/knowledge-core/tests/test_reranker_live\.py''',
+  '''packages/mcp-sdk/forge_mcp/testing\.py''',
+  # HARD-05: fake bearer/sk-… shapes exercising the live MCP transport redaction
+  # + a planted FAKE secret in the reference server's fixture corpus. No real cred.
+  '''packages/mcp-sdk/forge_mcp/reference_server\.py''',
+  '''packages/mcp-sdk/tests/test_transports_jsonrpc\.py''',
+  '''packages/mcp-sdk/tests/test_transports_http\.py''',
+  '''packages/mcp-sdk/tests/test_live_mcp_integration\.py''',
+  '''apps/api/tests/test_obs_redaction\.py''',
+  # HARD-02: fake sk-…/Bearer… shapes that exercise the model-client redactor.
+  '''packages/agent-runtime/tests/test_providers_redaction\.py''',
+  # HARD-06: fake xoxb-… bot token + fake Slack signing-secret shapes exercising
+  # the notifier redaction / repr and the inbound v0 signature verifier. No real cred.
+  '''packages/integration-sdk/tests/test_slack\.py''',
+  '''apps/api/tests/test_slack_inbound\.py''',
+  # Fake RFC example RSA key + AWS example key (AKIA…EXAMPLE) seeding the
+  # secret-exclusion/redaction corpus assertions (_FAKE_PEM / _FAKE_AWS_KEY).
+  '''packages/evaluation/tests/test_corpus_eval\.py''',
+  '''apps/api/tests/test_obs_otel\.py''',
+  '''apps/api/tests/test_obs_router\.py''',
+  '''apps/api/tests/test_obs_audit\.py''',
+  '''tests/security/fixtures/.*''',
+  # Enforcement-matrix redaction samples (canonical FAKE shapes: sk-…, AKIA…EXAMPLE).
+  '''tests/security/matrix_checks\.py''',
+  # Integration ENV TEMPLATE — key names only, all values empty. "Never commit values."
+  '''\.env\.integration\.example''',
+  # Spec/docs prose that pattern-matched generic-api-key (no real values). These
+  # docs were removed from the working tree; the entry is retained for the
+  # full-history gitleaks scan (the files still exist in earlier commits).
+  '''docs/implementation-slices/.*\.md''',
+  # Documented DEV-ONLY compose defaults (header says NOT for production);
+  # committed so `docker compose -f deploy/docker-compose.dev.yml up` works
+  # with zero setup. Waiver W-005 in security/waivers.yaml.
+  '''deploy/\.env\.dev''',
+  # Frontend walkthrough: `WALKTHROUGH_STORAGE_KEY = "forge.walkthrough.v1"` is a
+  # localStorage KEY NAME (a `*_KEY` constant), not a credential — false positive.
+  '''apps/web/src/components/walkthrough/tour-context\.tsx''',
+  # Fake `forge_scim_SECRET123` SCIM token in a Vitest mock (SSO settings view).
+  '''apps/web/src/components/sso/sso-settings-view\.test\.tsx''',
+  # Fake `sk-…` fixture whose test asserts the Postgres audit store REDACTS it.
+  '''apps/api/tests/test_audit_store_db\.py''',
+]

@@ -1,0 +1,663 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least-privilege default for every job: read-only checkout. Jobs that need more
+# (e.g. `security` uploads SARIF) opt in explicitly with their own permissions block.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  # ------------------------------------------------------------------- #
+  # Python: lint + type-check + tests (against a real pgvector Postgres) #
+  # ------------------------------------------------------------------- #
+  python:
+    name: python (lint + types + tests)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: forge
+          POSTGRES_DB: forge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U forge"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      # Celery's broker. Several worker tests (supervised multi-agent dispatch,
+      # the MCP token bucket) talk to a real Redis rather than a fake, and
+      # without one they fail with ECONNREFUSED rather than skipping — the job
+      # declared Postgres but never this.
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FORGE_TEST_DATABASE_URL: postgresql+psycopg://forge:forge@localhost:5432/forge_test
+      FORGE_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync workspace
+        run: uv sync --all-packages
+
+      - name: Lint (ruff check)
+        run: uv run ruff check .
+
+      - name: Format check (ruff format)
+        run: uv run ruff format --check .
+
+      - name: Type-check (mypy)
+        # Single source of truth: the package list + module-mode invocation live
+        # in the Makefile (module mode avoids the dual source-root ambiguity of
+        # `mypy packages apps`). CI and local stay in lockstep this way.
+        run: make typecheck
+
+      - name: Test (pytest)
+        run: uv run pytest -q
+
+      # HARD-11 (G-COVERAGE): the two most side-effecty units — the Celery tasks
+      # and the agent runtime — must stay >= 90% so untested error/retry/cleanup
+      # branches cannot creep back in. The whole-repo suite above stays the
+      # overall gate; these enforce the per-package floors.
+      - name: Coverage floor (worker + agent-runtime >= 90%)
+        run: |
+          uv run pytest apps/worker --cov=forge_worker --cov-report= --cov-fail-under=90 -q
+          uv run pytest packages/agent-runtime --cov=forge_agent --cov-report= --cov-fail-under=90 -q
+
+  # ------------------------------------------------------------------- #
+  # Honest real-corpus retrieval eval (HARD-04): learned local embedder #
+  # over the real repo, regression-gated on the committed baseline. No   #
+  # DB service (SQLite path); model restored from cache, offline at call #
+  # time after warm cache.                                               #
+  # ------------------------------------------------------------------- #
+  realeval:
+    name: realeval (honest retrieval quality)
+    runs-on: ubuntu-latest
+    env:
+      SENTENCE_TRANSFORMERS_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+      FORGE_RUN_REALEVAL: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      # The learned embedder is the optional `eval` extra (sentence-transformers);
+      # it is not part of the default sync so the main lane stays fast. Install it
+      # explicitly into the synced env (workspace-member extras are opt-in).
+      - name: Sync workspace + install eval extra
+        run: |
+          uv sync --all-packages
+          uv pip install "sentence-transformers>=3.0"
+
+      - name: Restore sentence-transformers model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.HF_HOME }}
+          key: st-model-${{ env.SENTENCE_TRANSFORMERS_MODEL }}
+
+      - name: Real-corpus eval tests (regression-gated)
+        run: uv run pytest -m realeval -q
+
+      - name: Write EVAL_RESULTS.md + enforce regression floor
+        # Non-zero exit (below the committed FORGE_EVAL_RECALL_FLOOR /
+        # FORGE_EVAL_NDCG_FLOOR) fails the job.
+        run: uv run python -m forge_eval.corpus_eval --write-report
+
+      - name: Upload eval report artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: eval-results
+          path: docs/EVAL_RESULTS.md
+
+  # ------------------------------------------------------------------- #
+  # HARD-01 (G-GH): live GitHub App round-trip against api.github.com.    #
+  # OPT-IN — runs only where the FORGE_GITHUB_* secrets exist (a          #
+  # protected CI context); forks / secret-less PRs skip it entirely and   #
+  # the default `python` job stays network-free. The App private key is   #
+  # written at runtime with add-mask (no `set -x`) and never echoed.      #
+  # ------------------------------------------------------------------- #
+  integration-github:
+    name: integration-github (live GitHub App, creds-gated)
+    runs-on: ubuntu-latest
+    # Only attempt when the App id secret is present (all five travel together).
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    env:
+      FORGE_GITHUB_APP_ID: ${{ secrets.FORGE_GITHUB_APP_ID }}
+      FORGE_GITHUB_INSTALLATION_ID: ${{ secrets.FORGE_GITHUB_INSTALLATION_ID }}
+      FORGE_GITHUB_WEBHOOK_SECRET: ${{ secrets.FORGE_GITHUB_WEBHOOK_SECRET }}
+      FORGE_GITHUB_TEST_REPO: ${{ secrets.FORGE_GITHUB_TEST_REPO }}
+      FORGE_GITHUB_APP_PRIVATE_KEY_PATH: deploy/secrets/github-app.pem
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync workspace
+        run: uv sync --all-packages
+
+      # Write the App private key to a gitignored path. The secret is passed via
+      # env (never interpolated into the script body) and written with printf; no
+      # `set -x` around the write so it is never echoed.
+      - name: Materialise GitHub App private key
+        if: ${{ env.FORGE_GITHUB_APP_ID != '' }}
+        env:
+          APP_PRIVATE_KEY: ${{ secrets.FORGE_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          mkdir -p deploy/secrets
+          printf '%s' "$APP_PRIVATE_KEY" > deploy/secrets/github-app.pem
+          chmod 600 deploy/secrets/github-app.pem
+
+      - name: Live GitHub lane (skips cleanly if creds absent)
+        run: uv run pytest -m live_github -q
+
+  # ------------------------------------------------------------------- #
+  # HARD-05 (G-MCP): live MCP transport against the self-hosted          #
+  # reference server — real HTTP/stdio, NO external SaaS or credential.  #
+  # Self-hosts the loopback reference server, so this lane runs green    #
+  # with zero secrets. The default `python` job stays hermetic (live_mcp #
+  # skips when MCP_LIVE_TRANSPORT is unset).                             #
+  # ------------------------------------------------------------------- #
+  mcp-integration:
+    name: mcp-integration (live MCP, self-hosted reference server)
+    runs-on: ubuntu-latest
+    env:
+      MCP_LIVE_TRANSPORT: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync workspace
+        run: uv sync --all-packages
+
+      - name: Live MCP lane (self-hosted reference server; no external cred)
+        run: uv run pytest -m live_mcp -q
+
+  # ------------------------------------------------------------------- #
+  # HARD-06 (G-SLACK): live Slack integration against a disposable test #
+  # workspace. Runs ONLY when the SLACK_BOT_TOKEN secret is present     #
+  # (all three travel together); forks / secret-less PRs skip entirely  #
+  # and the default `python` job stays hermetic (live_slack skips when  #
+  # the SLACK_* creds are absent). Secrets flow via env, never echoed.  #
+  # ------------------------------------------------------------------- #
+  slack-integration:
+    name: slack-integration (live Slack, creds-gated)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    env:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_SIGNING_SECRET: ${{ secrets.SLACK_SIGNING_SECRET }}
+      SLACK_TEST_CHANNEL: ${{ secrets.SLACK_TEST_CHANNEL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync workspace
+        run: uv sync --all-packages
+
+      - name: Live Slack lane (skips cleanly if creds absent)
+        run: uv run pytest -m live_slack -q
+
+  web:
+    name: web (lint + types + tests + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pnpm
+        # Version comes from package.json "packageManager" — passing `version:`
+        # too makes pnpm/action-setup v4 fail with "multiple versions specified".
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm -r lint
+
+      # The web package ships 89 vitest files and a `tsc --noEmit` typecheck that
+      # previously only ran in the (unreachable) release workflow. Gate both on
+      # every PR/push, after lint and before build, so a type error or a broken
+      # component test blocks the merge instead of shipping.
+      - name: Type-check (tsc)
+        run: pnpm --filter @forge/web typecheck
+
+      - name: Test (vitest)
+        run: pnpm --filter @forge/web test
+
+      - name: Build
+        run: pnpm -r build
+
+      # HARD-09: web dependency CVE scan (high/critical fails the build;
+      # waivable via pnpm overrides documented in security/waivers.yaml).
+      - name: Audit (pnpm)
+        working-directory: apps/web
+        run: pnpm audit --audit-level=high
+
+  # ------------------------------------------------------------------- #
+  # Security (HARD-09, G-SEC-AUTOMATED): SAST + deps + secrets + SBOM +   #
+  # the wired enforcement-matrix regression suite. Blocking on            #
+  # high/critical; accepted risk is dated in security/waivers.yaml.       #
+  # ------------------------------------------------------------------- #
+  security:
+    name: security (sast + deps + secrets + sbom + matrix)
+    runs-on: ubuntu-latest
+    # Public repo: code scanning is available, so the SARIF-upload steps below
+    # opt into security-events:write. On a private repo without GHAS those steps
+    # are guarded off (github.event.repository.private == false) and this extra
+    # scope is simply unused, so the job stays green either way.
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0        # full history for gitleaks
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync workspace
+        run: uv sync --all-packages
+
+      - name: Validate waivers (fails closed on expiry)
+        run: uv run python scripts/security/check_waivers.py security/waivers.yaml
+
+      # --- SAST --- #
+      - name: Bandit (SARIF)
+        run: uv run bandit -c pyproject.toml -r packages apps -f sarif -o bandit.sarif
+        continue-on-error: true
+      - name: Bandit gate (high/critical)
+        run: uv run bandit -c pyproject.toml -r packages apps --severity-level high -q
+      - name: Semgrep (custom Forge rules, SARIF)
+        run: >-
+          uv run semgrep --config .semgrep/forge.yml --config p/python
+          --error --metrics=off --sarif -o semgrep.sarif .
+
+      # --- Dependency audit --- #
+      # No ignores: semgrep has lifted its click<8.2 cap, so click resolves to
+      # 8.4.2 and PYSEC-2026-2132 no longer applies.
+      - name: pip-audit
+        run: >-
+          uv export --frozen --format requirements-txt --no-emit-workspace
+          | uv run pip-audit -r /dev/stdin --strict
+
+      # --- Secret scan (full history) --- #
+      # The gitleaks GitHub Action requires a paid license for ORGANIZATION
+      # repos; run the pinned binary directly instead (MIT, no license needed).
+      # `gitleaks detect` scans the full git history and exits non-zero on a hit.
+      - name: gitleaks (binary, no org license)
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
+            | tar -xz -C /tmp gitleaks
+          /tmp/gitleaks detect --source . --config .gitleaks.toml --redact --no-banner
+
+      # --- SBOM --- #
+      - name: SBOM (CycloneDX)
+        run: uv run cyclonedx-py environment -o sbom.cdx.json
+
+      # --- Enforcement-matrix regression suite (wired path) --- #
+      - name: Enforcement matrix
+        run: uv run pytest -m security -q
+
+      # SARIF upload needs code scanning — available on the public repo (skipped
+      # on a private repo so the gate stays green). Each tool's SARIF is uploaded
+      # as a SEPARATE run with its own `category`: GitHub code scanning rejects a
+      # single delivery that mixes multiple runs under the same category. The SAST
+      # steps above still gate on high/critical regardless of the upload.
+      - name: Upload Bandit SARIF
+        if: ${{ always() && github.event.repository.private == false && hashFiles('bandit.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        with:
+          sarif_file: bandit.sarif
+          category: bandit
+      - name: Upload Semgrep SARIF
+        if: ${{ always() && github.event.repository.private == false && hashFiles('semgrep.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ------------------------------------------------------------------- #
+  # HARD-13: secrets & config preflight + hermetic crypto/vault/provider #
+  # unit suite. Fails closed on a missing key / deprecated alias /       #
+  # envelope-off-in-prod, so a misconfigured deploy cannot merge.        #
+  # ------------------------------------------------------------------- #
+  secrets-config:
+    name: secrets-config (fail-closed preflight)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync workspace
+        run: uv sync --all-packages
+
+      # A valid prod-like env must pass the fail-closed preflight.
+      - name: check-config (valid prod env passes)
+        env:
+          FORGE_ENVIRONMENT: production
+        run: |
+          export FORGE_SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          uv run python -m forge_api.cli_secrets check-config
+
+      # A missing key must fail closed (exit non-zero) — assert it does.
+      - name: check-config (missing key fails closed)
+        env:
+          FORGE_ENVIRONMENT: production
+        run: |
+          if uv run python -m forge_api.cli_secrets check-config; then
+            echo "::error::check-config passed with no FORGE_SECRET_KEY (should fail closed)"
+            exit 1
+          fi
+          echo "check-config correctly failed closed on a missing key"
+
+      # Hermetic crypto / vault / provider / redaction unit suite.
+      - name: Secret subsystem unit suite
+        run: >-
+          uv run pytest -q
+          apps/api/tests/test_auth_crypto_envelope.py
+          apps/api/tests/test_auth_keyring.py
+          apps/api/tests/test_auth_providers.py
+          apps/api/tests/test_auth_vault_expiry.py
+          apps/api/tests/test_auth_agent_token_ttl.py
+          apps/api/tests/test_auth_service_key.py
+          apps/api/tests/test_obs_log_redaction.py
+          apps/api/tests/test_obs_span_redaction.py
+          apps/api/tests/test_cli_secrets.py
+          apps/api/tests/test_auth_secrets_rotate.py
+
+  # ------------------------------------------------------------------- #
+  # Deploy: validate compose files build cleanly                         #
+  # ------------------------------------------------------------------- #
+  compose:
+    name: compose (config validation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate production compose
+        # The prod compose requires ${FORGE_SECRET_KEY:?} by design; supply a
+        # throwaway value so `config` can validate (never a real secret).
+        env:
+          FORGE_SECRET_KEY: ci-compose-validation-dummy-not-a-secret
+        run: docker compose -f deploy/docker-compose.yml config --quiet
+
+      - name: Validate dev compose
+        run: docker compose -f deploy/docker-compose.dev.yml config --quiet
+
+  # ------------------------------------------------------------------- #
+  # Build (HARD-07, G-BUILD + G-IMG-PINNED): real image builds on a      #
+  # networked runner — digest-pin lint, shellcheck, compose build of all #
+  # 4 first-party images, per-image CycloneDX SBOMs, and an up -> healthy #
+  # -> /health -> down -v smoke of the production compose.               #
+  # ------------------------------------------------------------------- #
+  build:
+    name: build (images + sbom + smoke)
+    runs-on: ubuntu-latest
+    # The prod compose requires ${FORGE_SECRET_KEY:?}; `compose build` + smoke
+    # parse it, so provide a throwaway value (never a real secret).
+    env:
+      FORGE_SECRET_KEY: ci-build-validation-dummy-not-a-secret
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      - name: Check image digest pins (offline lint)
+        run: deploy/scripts/pin-digests.sh --check
+
+      - name: shellcheck deploy scripts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck deploy/scripts/*.sh
+
+      - name: Build images (docker compose build)
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: docker compose -f deploy/docker-compose.yml build
+
+      - name: Install syft
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync workspace
+        run: uv sync --all-packages
+
+      # Runs the full networked evidence chain: smoke.sh (up -> healthy ->
+      # /health -> down -v), runtime docker-inspect (non-root / healthcheck /
+      # memory limit), and per-image CycloneDX SBOM generation via sbom.sh.
+      - name: Integration tests (build + smoke + inspect + sbom)
+        env:
+          FORGE_BUILD_INTEGRATION_TESTS: "1"
+        run: uv run pytest -m integration tests/test_build_integration.py -q
+
+      - name: Upload build evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-evidence
+          path: |
+            deploy/sbom/*.cdx.json
+            deploy/build-manifest.json
+
+  # ------------------------------------------------------------------- #
+  # HARD-11 (G-PERF): non-blocking API load smoke. Visible, not gating   #
+  # (continue-on-error), so the k6 harness is exercised on every PR      #
+  # without flaking the required checks. The budgeted perf bench + soak  #
+  # are manual/nightly (see docs/self-hosting/performance.md).           #
+  # ------------------------------------------------------------------- #
+  load-smoke:
+    name: load-smoke (k6, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: forge
+          POSTGRES_DB: forge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U forge"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FORGE_DATABASE_URL: postgresql+psycopg://forge:forge@localhost:5432/forge_test
+      FORGE_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync workspace
+        run: uv sync --all-packages
+
+      - name: Migrate + start API
+        run: |
+          export FORGE_SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          uv run alembic -c packages/db/alembic.ini upgrade head
+          uv run uvicorn forge_api.main:app --host 127.0.0.1 --port 8000 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/health && break
+            sleep 1
+          done
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install -y k6
+
+      - name: k6 smoke (few VUs, seconds)
+        run: k6 run -e SMOKE=1 -e BASE_URL=http://127.0.0.1:8000 deploy/load/k6/api_hotpaths.js
+
+  # ------------------------------------------------------------------- #
+  # HARD-12: conventional-commit lint over the PR range. Keeps the       #
+  # changelog + SemVer bump derivable; a non-conforming commit message   #
+  # (e.g. "wip stuff") blocks the PR.                                     #
+  # ------------------------------------------------------------------- #
+  commitlint:
+    name: commitlint (conventional commits)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # full range so cz can see every PR commit
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync (dev group brings commitizen)
+        run: uv sync
+
+      - name: Lint PR commit messages (cz check)
+        run: >-
+          uv run cz check
+          --rev-range ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+
+  # ------------------------------------------------------------------- #
+  # HARD-12: render RELEASE_READINESS.md on every PR (non-blocking — the  #
+  # offline gates inside it are already blocking via the suite; this job  #
+  # publishes the honest dated report as an artifact).                    #
+  # ------------------------------------------------------------------- #
+  readiness:
+    name: readiness (RELEASE_READINESS.md, non-blocking)
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_READINESS_BAR: beta
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync workspace
+        run: uv sync --all-packages
+
+      - name: Render readiness report (report-only, never fails the PR)
+        run: >-
+          uv run forge-release-readiness --bar "${RELEASE_READINESS_BAR}"
+          --report-only --out RELEASE_READINESS.md
+
+      - name: Upload readiness report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-readiness
+          path: RELEASE_READINESS.md

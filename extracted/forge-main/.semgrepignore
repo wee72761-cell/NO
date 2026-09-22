@@ -1,0 +1,21 @@
+# Scope for `semgrep --config .semgrep/forge.yml .` (HARD-09).
+# Test trees deliberately contain fake secrets and rule-triggering fixtures;
+# the fixture regression test copies tests/security/fixtures to a tmp dir and
+# scans that copy, so excluding it here does not blind the rule tests.
+.git/
+.venv/
+node_modules/
+__pycache__/
+tests/
+*/tests/*
+packages/*/tests/
+apps/*/tests/
+conftest.py
+# Alembic migrations are reviewed DDL (CREATE SCHEMA / DO $$ blocks / ALTER TABLE)
+# that legitimately use sqlalchemy.text() with INTERNAL constants (table names,
+# not user input) — the avoid-sqlalchemy-text rule is a false positive there.
+packages/*/migrations/
+docs/
+examples/
+spec-templates/
+.semgrep/

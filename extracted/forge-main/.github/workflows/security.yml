@@ -1,0 +1,87 @@
+# Focused OSS security workflow: secret scan (gitleaks) + Python SAST (bandit)
+# + dependency audit (pip-audit). Runs on every push to main and every PR so a
+# regression is caught before merge. Least-privilege by default: this workflow
+# only reads the repository — it publishes nothing and needs no write scopes.
+#
+# Third-party (and official actions/*) actions are pinned to a full commit SHA
+# with a human-readable version comment, so a moved tag cannot alter what runs.
+#
+# NOTE — intentional overlap with ci.yml's `security` job: that job runs the
+# same scanners (bandit, pip-audit, gitleaks) plus semgrep + SBOM + the
+# enforcement-matrix suite as part of the full green gate. This workflow is
+# kept as a separate, minimal-permission (contents: read only), fast-to-review
+# check so the core secret/SAST/dependency gate can be reasoned about (and
+# required in branch protection) independently of the rest of CI. Do not
+# de-duplicate one into the other without checking branch-protection required
+# status checks first.
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  # ------------------------------------------------------------------- #
+  # Secret scan: full history via gitleaks, using the repo .gitleaks.toml #
+  # ------------------------------------------------------------------- #
+  secrets:
+    name: secrets (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0        # full history for gitleaks
+
+      # The gitleaks GitHub Action requires a paid license for ORGANIZATION
+      # repos; run the pinned binary directly instead (MIT, no license needed).
+      - name: gitleaks (binary, no org license)
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
+            | tar -xz -C /tmp gitleaks
+          /tmp/gitleaks detect --source . --config .gitleaks.toml --redact --no-banner
+
+  # ------------------------------------------------------------------- #
+  # Python SAST + dependency audit: bandit (high/critical gate) and       #
+  # pip-audit against the frozen, resolved workspace requirements.         #
+  # ------------------------------------------------------------------- #
+  python:
+    name: python (bandit + pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync workspace
+        run: uv sync --all-packages
+
+      # SAST: config (exclusions + skips) lives in pyproject.toml. Fails the
+      # build on high-severity findings; accepted risk is triaged elsewhere.
+      - name: Bandit gate (high/critical)
+        run: uv run bandit -c pyproject.toml -r packages apps --severity-level high -q
+
+      # Dependency audit against the fully-resolved, frozen requirements set.
+      # No ignores: semgrep has lifted its click<8.2 cap, so click resolves to
+      # 8.4.2 and PYSEC-2026-2132 no longer applies.
+      - name: pip-audit
+        run: >-
+          uv export --frozen --format requirements-txt --no-emit-workspace
+          | uv run pip-audit -r /dev/stdin --strict
